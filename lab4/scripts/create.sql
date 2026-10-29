@@ -147,7 +147,7 @@ CREATE TABLE offer_price (
     offer_id bigint NOT NULL REFERENCES seller_offer(offer_id)
         ON DELETE CASCADE ON UPDATE CASCADE,
     price_value numeric(10, 2) NOT NULL CHECK (price_value > 0),
-    currency varchar(3) NOT NULL,
+    currency char(3) NOT NULL,
     starts_at timestamptz NOT NULL,
     ends_at timestamptz CHECK (ends_at IS NULL OR ends_at >= starts_at),
     terms text
