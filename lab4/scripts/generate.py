@@ -229,15 +229,17 @@ class MarketplaceDBFiller:
                         if i['offer']['family'] == 'food') >= 3
                     and any(i['offer']['gift'] for i in group['items']))
             group['id'] = self.insert('''INSERT INTO shipment
-                (shipment_number, sender, recipient, accepted_at, weight_kg,
-                 length_cm, width_cm, height_cm, comment, status)
-                VALUES (%s, %s, %s, %s, %s, 40, 30, 25, %s, %s) RETURNING shipment_id AS id''',
+                (shipment_number, sender, recipient, accepted_at, delivered_at, weight_kg,
+                length_cm, width_cm, height_cm, comment, status)
+                VALUES (%s, %s, %s, %s, %s, %s, 40, 30, 25, %s, %s) RETURNING shipment_id AS id''',
                 (f'SHP-{self.batch}-{index + 1:04}-{position}',
-                 offer['seller_name'] if offer['scheme'] == 'Склад продавца' else 'Склад маркетплейса «Озеро»',
-                 buyer, group['accepted'], weight,
-                 'Вложена открытка с рецептом.' if gift
-                 else f'Количество упаковок: {packages}. Доставка в пункт выдачи.',
-                 'Доставлено' if self.as_of >= group['delivered'] else 'В пути'))
+                offer['seller_name'] if offer['scheme'] == 'Склад продавца' else 'Склад маркетплейса «Озеро»',
+                buyer, group['accepted'],
+                group['delivered'] if self.as_of >= group['delivered'] else None,
+                weight,
+                'Вложена открытка с рецептом.' if gift
+                else f'Количество упаковок: {packages}. Доставка в пункт выдачи.',
+                'Доставлено' if self.as_of >= group['delivered'] else 'В пути'))
             self.shipments.append(group)
 
         for position, entry in enumerate(entries, 1):
@@ -270,7 +272,7 @@ class MarketplaceDBFiller:
                  total, currency, 'Оплата ' + number,
                  'Проведен' if self.as_of >= when + timedelta(minutes=5) else 'Ожидается'))
 
-    def fill_refunds_and_disputes(self):
+    def fill_refunds(self):
         for entry in self.items:
             offer, group = entry['offer'], entry['group']
             if (entry['state'] != 'Доставлена' or group['delivered'] > self.as_of - timedelta(days=7)
@@ -280,7 +282,7 @@ class MarketplaceDBFiller:
             quantity = self.random.randint(1, packages) * offer['pack_size']
             food = offer['family'] == 'food'
             condition = 'Поврежден' if food else self.random.choice(['Новый', 'Б/У'])
-            returned_at = group['delivered'] + timedelta(days=2)
+            returned_at = group['delivered'] + timedelta(days=self.random.randint(2, 6))
             refund_id = self.insert('''INSERT INTO refund
                 (item_id, refund_number, created_at, quantity, reason, condition,
                  return_route, responsible, status)
@@ -288,33 +290,21 @@ class MarketplaceDBFiller:
                 (entry['id'], f'RET-{self.batch}-{len(self.refunds) + 1:04}', returned_at, quantity,
                  'Брак' if food else 'Не подошло', condition, 'Покупатель → пункт приёма → продавец', self.fake.name()))
             refund = {'id': refund_id, 'item': entry, 'when': returned_at,
-                      'amount': item_amount(quantity, offer['price_value'], offer['discount']),
-                      'restocked': condition == 'Новый', 'decision': None}
+                'amount': item_amount(quantity, offer['price_value'], offer['discount']),
+                'restocked': condition == 'Новый',
+                'dispute_required': not food and condition == 'Б/У',
+                'dispute_opened_at': returned_at + timedelta(days=1)}
             self.refunds.append(refund)
             entry['returned'] = quantity
             if condition == 'Новый':
                 self.change_stock(offer, quantity)
             if quantity == entry['quantity']:
                 self.cursor.execute("UPDATE order_item SET status='Возвращена' WHERE item_id=%s", (entry['id'],))
-            if not food and condition == 'Б/У':
-                dispute_id = self.insert('''INSERT INTO dispute
-                    (seller_id, item_id, dispute_number, opened_at, subject, description, materials, responsible, status)
-                    VALUES (%s, %s, %s, %s, 'Возврат', %s, %s, %s, 'Решен') RETURNING dispute_id AS id''',
-                    (offer['seller_id'], entry['id'], f'DSP-{self.batch}-{len(self.refunds):04}',
-                     returned_at + timedelta(days=1), 'Продавец оспаривает возврат товара со следами использования.',
-                     'Учебные фотографии товара и акт приёмки.', self.fake.name()))
-                refund['decision_at'] = returned_at + timedelta(days=3)
-                refund['decision'] = self.insert('''INSERT INTO dispute_decision
-                    (dispute_id, decided_at, type, basis, author, responsible, status)
-                    VALUES (%s, %s, 'Частичная компенсация', %s, %s, %s, 'Вступило в силу')
-                    RETURNING decision_number AS id''',
-                    (dispute_id, refund['decision_at'], 'По акту и фотографиям компенсировать продавцу 50% удержания.',
-                     self.fake.name(), self.fake.name()))
         for order in self.orders:
             if all(i['returned'] == i['quantity'] for i in order['items']):
                 self.cursor.execute("UPDATE customer_order SET status='Возвращен' WHERE order_id=%s", (order['id'],))
                 self.cursor.execute("UPDATE payment SET status='Возвращен' WHERE order_id=%s", (order['id'],))
-        logging.info('Созданы %s возвратов и связанные с ними споры/решения.', len(self.refunds))
+        logging.info('Созданы %s возвратов.', len(self.refunds))
 
     def create_operation(self, seller_id, kind, amount, when, basis_id, note, status='Проведена'):
         operation_id = self.insert('''INSERT INTO financial_operation
@@ -325,6 +315,96 @@ class MarketplaceDBFiller:
         self.operation_count += 1
         return operation_id
 
+    def create_dispute(self, seller_id, operation_id, dispute_number,
+                   opened_at, subject, description, materials, status):
+        return self.insert('''INSERT INTO dispute
+            (seller_id, operation_id, dispute_number, opened_at, subject,
+            description, materials, responsible, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING dispute_id AS id''',
+            (seller_id, operation_id, dispute_number, opened_at, subject,
+            description, materials, self.fake.name(), status))
+
+
+    def create_dispute_with_decisions(self, seller_id, operation_id, operation_amount,
+        dispute_number, opened_at, subject, description, materials):
+
+        if self.random.random() < 0.15:
+            return self.create_dispute(
+                seller_id, operation_id, dispute_number,
+                opened_at, subject, description, materials, 'Открыт')
+
+        first_decision_at = opened_at + timedelta(days=self.random.randint(2, 5))
+
+        if first_decision_at > self.as_of:
+            return self.create_dispute(seller_id, operation_id, dispute_number,
+                opened_at, subject, description, materials, 'На рассмотрении')
+
+        decision_types = [
+            'В пользу продавца',
+            'В пользу площадки',
+            'Частичная компенсация'
+        ]
+
+        first_type = self.random.choice(decision_types)
+        second_decision_at = None
+
+        if self.random.random() < 0.25:
+            candidate_date = first_decision_at + timedelta(days=self.random.randint(2, 5))
+            if candidate_date <= self.as_of:
+                second_decision_at = candidate_date
+
+        dispute_id = self.create_dispute(seller_id, operation_id, dispute_number,
+            opened_at, subject, description, materials, 'Решен'
+        )
+
+        def insert_decision(decided_at, decision_type, basis, status):
+            return self.insert('''INSERT INTO dispute_decision
+                (dispute_id, decided_at, type, basis, author, responsible, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING decision_number AS id''',
+                (dispute_id, decided_at, decision_type, basis,
+                 self.fake.name(), self.fake.name(), status))
+
+        first_status = ('Обжаловано' if second_decision_at
+            else 'Вступило в силу')
+
+        first_decision_id = insert_decision(first_decision_at, first_type,
+            'Первоначальное рассмотрение спора.', first_status)
+
+        final_decision_id = first_decision_id
+        final_type = first_type
+        final_at = first_decision_at
+
+        if second_decision_at is not None:
+            if self.random.random() < 0.5:
+                second_type = self.random.choice([value for value in decision_types if value != first_type])
+            else:
+                second_type = first_type
+
+            final_decision_id = insert_decision(second_decision_at, second_type,
+                'Повторное рассмотрение с учётом дополнительных материалов.',
+                'Вступило в силу')
+            final_type = second_type
+            final_at = second_decision_at
+        
+        if final_type == 'В пользу продавца':
+            self.create_operation(seller_id, 'Сторно', money(-operation_amount), final_at,
+                operation_id, 'Полное сторнирование оспариваемой операции по решению спора.')
+            self.cursor.execute('''
+                UPDATE financial_operation
+                SET status = 'Сторнирована'
+                WHERE operation_id = %s
+            ''', (operation_id,))
+
+        elif final_type == 'Частичная компенсация':
+            compensation_amount = money(abs(operation_amount) * Decimal('0.5'))
+            self.create_operation(seller_id, 'Компенсация', compensation_amount, final_at,
+                final_decision_id, 'Компенсация 50% по решению спора.')
+
+        return dispute_id
+
+
     def fill_financial_operations(self):
         for entry in self.items:
             offer, group = entry['offer'], entry['group']
@@ -333,10 +413,25 @@ class MarketplaceDBFiller:
             seller = offer['seller_id']
             rules = offer['rules']
             deadline = entry['order']['when'] + timedelta(days=2)
+            
             if (entry['assignment_id'] and group['transfer'] <= self.as_of
                     and group['transfer'] > deadline and rules['penalty'] > 0):
-                self.create_operation(seller, 'Штраф', -rules['penalty'], group['transfer'],
-                                      entry['assignment_id'], 'Просрочка фактической передачи по поручению.')
+                penalty_operation_id = self.create_operation(
+                    seller, 'Штраф', -rules['penalty'], group['transfer'],
+                    entry['assignment_id'], 'Просрочка фактической передачи по поручению.'
+                )
+                if self.random.random() < 0.3:
+                    self.create_dispute_with_decisions(
+                        seller,
+                        penalty_operation_id,
+                        -rules['penalty'],
+                        f'DSP-{self.batch}-P{self.operation_count:04}',
+                        min(group['transfer'] + timedelta(hours=1), self.as_of),
+                        'Штраф',
+                        'Продавец оспаривает начисление штрафа за просрочку передачи товара.',
+                        'Заявление продавца и сведения о сроках передачи товара.'
+                    )
+
             if entry['state'] != 'Доставлена':
                 continue
             delivered = group['delivered']
@@ -355,13 +450,25 @@ class MarketplaceDBFiller:
             fee = offer['rules']['logistics']
             self.create_operation(offer['seller_id'], 'Логистика', -fee, group['delivered'],
                                   group['id'], 'Плата за доставленное отправление.')
+        
         for refund in self.refunds:
             seller = refund['item']['offer']['seller_id']
-            self.create_operation(seller, 'Удержание', -refund['amount'], refund['when'], refund['id'],
-                                  'Стоимость обработанного возврата; комиссия и логистика сохраняются.')
-            if refund['decision']:
-                self.create_operation(seller, 'Компенсация', refund['amount'] / 2,
-                                      refund['decision_at'], refund['decision'], 'Компенсация 50% по решению спора.')
+            withholding_operation_id = self.create_operation(
+                seller, 'Удержание', -refund['amount'], refund['when'], refund['id'],
+                'Стоимость обработанного возврата; комиссия и логистика сохраняются.'
+            )
+            if refund['dispute_required']:
+                opened_at = min(refund['dispute_opened_at'], self.as_of)
+                self.create_dispute_with_decisions(
+                    seller,
+                    withholding_operation_id,
+                    -refund['amount'],
+                    f'DSP-{self.batch}-R{self.operation_count:04}',
+                    opened_at,
+                    'Удержание',
+                    'Продавец оспаривает удержание за возврат товара со следами использования.',
+                    'Учебные фотографии товара и акт приёмки.'
+                )
 
     def fill_payouts(self):
         balances = self.rows('''SELECT seller_id, SUM(amount) AS balance FROM financial_operation
@@ -404,7 +511,7 @@ class MarketplaceDBFiller:
             self.connect()
             self.fetch_dictionary()
             self.fill_orders_and_items(num_orders)
-            self.fill_refunds_and_disputes()
+            self.fill_refunds()
             self.fill_financial_operations()
             self.fill_payouts()
             self.check_totals()

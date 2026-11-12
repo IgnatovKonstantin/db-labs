@@ -55,7 +55,7 @@ CREATE TYPE seller_type_enum AS ENUM ('ИП', 'ООО', 'Самозанятый'
 CREATE TYPE seller_status_enum AS ENUM ('Активен', 'Не активен', 'Заблокирован', 'На проверке');
 CREATE TYPE contract_status_enum AS ENUM ('Действует', 'Приостановлен', 'Расторгнут', 'Истек');
 CREATE TYPE unit_of_measure_enum AS ENUM ('шт', 'кг', 'уп', 'л', 'м');
-CREATE TYPE product_status_enum AS ENUM ('Активен', 'Нет в наличии', 'Архив');
+CREATE TYPE product_status_enum AS ENUM ('Активен', 'Архив');
 CREATE TYPE scheme_type_enum AS ENUM ('Склад продавца', 'Склад маркетплейса');
 CREATE TYPE offer_status_enum AS ENUM ('Активно', 'Неактивно', 'Приостановлено');
 CREATE TYPE promotion_type_enum AS ENUM ('Скидка на товар', 'Скидка на заказ', 'Подарок', 'Бонус');
@@ -70,9 +70,9 @@ CREATE TYPE financial_operation_status_enum AS ENUM ('Проведена', 'Ст
 CREATE TYPE refund_reason_enum AS ENUM ('Брак', 'Не подошло', 'Не доставлено', 'Иное');
 CREATE TYPE product_condition_enum AS ENUM ('Новый', 'Б/У', 'Поврежден', 'Отсутствует');
 CREATE TYPE refund_status_enum AS ENUM ('Оформлен', 'В пути', 'Принят на складе', 'Обработан', 'Отклонен');
-CREATE TYPE dispute_subject_enum AS ENUM ('Удержание', 'Возврат', 'Штраф', 'Логистика', 'Иное');
-CREATE TYPE dispute_status_enum AS ENUM ('Открыт', 'На рассмотрении', 'Решен', 'Отклонен', 'Закрыт');
-CREATE TYPE decision_type_enum AS ENUM ('В пользу продавца', 'В пользу площадки', 'Частичная компенсация', 'Повторное рассмотрение', 'Отказ');
+CREATE TYPE dispute_subject_enum AS ENUM ('Удержание', 'Возврат', 'Штраф');
+CREATE TYPE dispute_status_enum AS ENUM ('Открыт', 'На рассмотрении', 'Решен');
+CREATE TYPE decision_type_enum AS ENUM ('В пользу продавца', 'В пользу площадки', 'Частичная компенсация');
 CREATE TYPE decision_status_enum AS ENUM ('Вынесено', 'Вступило в силу', 'Обжаловано', 'Отменено');
 
 
@@ -147,7 +147,7 @@ CREATE TABLE offer_price (
     offer_id bigint NOT NULL REFERENCES seller_offer(offer_id)
         ON DELETE CASCADE ON UPDATE CASCADE,
     price_value numeric(10, 2) NOT NULL CHECK (price_value > 0),
-    currency char(3) NOT NULL,
+    currency varchar(3) NOT NULL,
     starts_at timestamptz NOT NULL,
     ends_at timestamptz CHECK (ends_at IS NULL OR ends_at >= starts_at),
     terms text
@@ -186,6 +186,7 @@ CREATE TABLE shipment (
     sender varchar(200) NOT NULL,
     recipient varchar(200) NOT NULL,
     accepted_at timestamptz NOT NULL,
+    delivered_at timestamptz CHECK (delivered_at IS NULL OR delivered_at >= accepted_at),
     weight_kg numeric(10, 3) CHECK (weight_kg IS NULL OR weight_kg > 0), 
     length_cm int CHECK (length_cm IS NULL OR length_cm > 0),
     width_cm int CHECK (width_cm IS NULL OR width_cm > 0),
@@ -279,7 +280,7 @@ CREATE TABLE dispute (
     dispute_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     seller_id bigint NOT NULL REFERENCES seller(seller_id)
         ON DELETE RESTRICT ON UPDATE CASCADE,
-    item_id bigint NOT NULL REFERENCES order_item(item_id)
+    operation_id bigint NOT NULL REFERENCES financial_operation(operation_id)
         ON DELETE RESTRICT ON UPDATE CASCADE,
     dispute_number varchar(30) NOT NULL UNIQUE,
     opened_at timestamptz NOT NULL,
@@ -383,7 +384,7 @@ CREATE TABLE payout_operation (
 CREATE TABLE reversal_operation (
     operation_id bigint PRIMARY KEY REFERENCES financial_operation(operation_id)
         ON DELETE CASCADE ON UPDATE CASCADE,
-    origin_operation_id bigint NOT NULL REFERENCES financial_operation(operation_id)
+    origin_operation_id bigint NOT NULL UNIQUE REFERENCES financial_operation(operation_id)
         ON DELETE RESTRICT ON UPDATE CASCADE,
 
     CONSTRAINT not_self_operation 
